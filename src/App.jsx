@@ -10,13 +10,13 @@ import {
   orderBy,
   setDoc,
   getDoc,
-  Timestamp
+  Timestamp,
+  updateDoc
 } from 'firebase/firestore';
 import { signInWithEmailAndPassword, signOut, onAuthStateChanged } from 'firebase/auth';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import './App.css';
 
-// Session timeout in milliseconds (15 minutes)
 const SESSION_TIMEOUT = 15 * 60 * 1000;
 
 function App() {
@@ -40,10 +40,20 @@ function App() {
     alternatives: 0
   });
 
-  // Activity tracking
+  // Monthly update state
+  const [updateDate, setUpdateDate] = useState(new Date().toISOString().split('T')[0]);
+  const [bulkUpdates, setBulkUpdates] = useState({});
+
+  // Chart filters
+  const [chartFilters, setChartFilters] = useState({
+    cash: true,
+    bonds: true,
+    equities: true,
+    alternatives: true
+  });
+
   const [lastActivity, setLastActivity] = useState(Date.now());
 
-  // Form state
   const [formData, setFormData] = useState({
     name: '',
     assetClass: '',
@@ -61,7 +71,6 @@ function App() {
     ytm: ''
   });
 
-  // Check authentication state
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
       setUser(currentUser);
@@ -73,7 +82,6 @@ function App() {
     return () => unsubscribe();
   }, []);
 
-  // Track user activity
   useEffect(() => {
     if (!user) return;
 
@@ -94,7 +102,6 @@ function App() {
     };
   }, [user]);
 
-  // Check for session timeout
   useEffect(() => {
     if (!user) return;
 
@@ -104,12 +111,11 @@ function App() {
         handleLogout();
         alert('Session expired due to inactivity. Please log in again.');
       }
-    }, 60000); // Check every minute
+    }, 60000);
 
     return () => clearInterval(interval);
   }, [user, lastActivity]);
 
-  // Load data when user is authenticated
   useEffect(() => {
     if (user) {
       loadPositions();
@@ -118,12 +124,23 @@ function App() {
     }
   }, [user]);
 
-  // Calculate asset summary when positions change
   useEffect(() => {
     calculateAssetSummary();
   }, [positions]);
 
-  // Login handler
+  // Initialize bulk updates when positions load
+  useEffect(() => {
+    const updates = {};
+    positions.forEach(pos => {
+      updates[pos.id] = {
+        currentPrice: pos.currentPrice || '',
+        currentValue: pos.currentValue || '',
+        accruedInterest: pos.accruedInterest || 0
+      };
+    });
+    setBulkUpdates(updates);
+  }, [positions]);
+
   const handleLogin = async (e) => {
     e.preventDefault();
     setLoginError('');
@@ -136,7 +153,6 @@ function App() {
     }
   };
 
-  // Logout handler
   const handleLogout = async () => {
     try {
       await signOut(auth);
@@ -147,7 +163,6 @@ function App() {
     }
   };
 
-  // Load positions from Firestore
   const loadPositions = async () => {
     try {
       const querySnapshot = await getDocs(collection(db, 'positions'));
@@ -161,7 +176,6 @@ function App() {
     }
   };
 
-  // Load last update timestamp
   const loadLastUpdate = async () => {
     try {
       const docRef = doc(db, 'metadata', 'lastUpdate');
@@ -174,7 +188,6 @@ function App() {
     }
   };
 
-  // Load portfolio history
   const loadPortfolioHistory = async () => {
     try {
       const q = query(collection(db, 'portfolioHistory'), orderBy('date', 'asc'));
@@ -189,7 +202,6 @@ function App() {
     }
   };
 
-  // Calculate asset class summary
   const calculateAssetSummary = () => {
     const summary = {
       cash: 0,
@@ -215,7 +227,6 @@ function App() {
     setAssetSummary(summary);
   };
 
-  // Add or update position
   const handleSubmit = async (e) => {
     e.preventDefault();
     
@@ -259,7 +270,78 @@ function App() {
     }
   };
 
-  // Open edit modal
+  // Handle bulk update changes
+  const handleBulkUpdateChange = (positionId, field, value) => {
+    setBulkUpdates(prev => ({
+      ...prev,
+      [positionId]: {
+        ...prev[positionId],
+        [field]: value
+      }
+    }));
+  };
+
+  // Save monthly update
+  const saveMonthlyUpdate = async () => {
+    if (!confirm('Save monthly update for all positions and create portfolio snapshot?')) return;
+
+    try {
+      const updatePromises = [];
+      
+      // Update all positions
+      for (const [positionId, updates] of Object.entries(bulkUpdates)) {
+        const positionRef = doc(db, 'positions', positionId);
+        updatePromises.push(
+          updateDoc(positionRef, {
+            currentPrice: parseFloat(updates.currentPrice),
+            currentValue: parseFloat(updates.currentValue),
+            accruedInterest: parseFloat(updates.accruedInterest) || 0,
+            updatedAt: Timestamp.now()
+          })
+        );
+      }
+
+      await Promise.all(updatePromises);
+
+      // Calculate totals for snapshot
+      let cashTotal = 0, bondsTotal = 0, equitiesTotal = 0, alternativesTotal = 0, totalValue = 0;
+
+      positions.forEach(position => {
+        const value = parseFloat(bulkUpdates[position.id]?.currentValue || position.currentValue) || 0;
+        totalValue += value;
+
+        if (position.assetClass === 'cash') cashTotal += value;
+        else if (position.assetClass === 'bonds') bondsTotal += value;
+        else if (position.assetClass === 'equities') equitiesTotal += value;
+        else if (position.assetClass === 'alternatives') alternativesTotal += value;
+      });
+
+      // Save portfolio snapshot
+      await addDoc(collection(db, 'portfolioHistory'), {
+        date: Timestamp.fromDate(new Date(updateDate)),
+        totalValue: totalValue,
+        cashValue: cashTotal,
+        bondsValue: bondsTotal,
+        equitiesValue: equitiesTotal,
+        alternativesValue: alternativesTotal,
+        createdAt: Timestamp.now()
+      });
+
+      // Update last update timestamp
+      await setDoc(doc(db, 'metadata', 'lastUpdate'), {
+        timestamp: Timestamp.now()
+      });
+
+      alert('Monthly update saved successfully!');
+      loadPositions();
+      loadPortfolioHistory();
+      loadLastUpdate();
+    } catch (error) {
+      console.error('Error saving monthly update:', error);
+      alert('Failed to save monthly update');
+    }
+  };
+
   const handleEdit = (position) => {
     setEditingPosition(position);
     setFormData({
@@ -281,7 +363,6 @@ function App() {
     setShowModal(true);
   };
 
-  // Delete position
   const handleDelete = async (id) => {
     if (!confirm('Are you sure you want to delete this position?')) return;
 
@@ -295,7 +376,6 @@ function App() {
     }
   };
 
-  // Reset form
   const resetForm = () => {
     setFormData({
       name: '',
@@ -316,7 +396,6 @@ function App() {
     setEditingPosition(null);
   };
 
-  // Handle form input changes
   const handleInputChange = (e) => {
     setFormData({
       ...formData,
@@ -324,18 +403,15 @@ function App() {
     });
   };
 
-  // Get total portfolio value
   const getTotalValue = () => {
     return assetSummary.cash + assetSummary.bonds + assetSummary.equities + assetSummary.alternatives;
   };
 
-  // Get percentage for asset class
   const getPercentage = (value) => {
     const total = getTotalValue();
     return total > 0 ? ((value / total) * 100).toFixed(2) : 0;
   };
 
-  // Filter history by period
   const getFilteredHistory = () => {
     if (portfolioHistory.length === 0) return [];
     
@@ -359,20 +435,39 @@ function App() {
     });
   };
 
-  // Prepare chart data
   const getChartData = () => {
     const filtered = getFilteredHistory();
-    return filtered.map(item => ({
-      date: item.date?.toDate().toLocaleDateString(),
-      total: item.totalValue,
-      cash: item.cashValue,
-      bonds: item.bondsValue,
-      equities: item.equitiesValue,
-      alternatives: item.alternativesValue
+    return filtered.map((item, index) => {
+      const prevItem = index > 0 ? filtered[index - 1] : null;
+      
+      const calculateChange = (current, previous) => {
+        if (!previous || previous === 0) return 0;
+        return (((current - previous) / previous) * 100).toFixed(2);
+      };
+
+      return {
+        date: item.date?.toDate().toLocaleDateString(),
+        total: item.totalValue,
+        totalChange: prevItem ? calculateChange(item.totalValue, prevItem.totalValue) : 0,
+        cash: chartFilters.cash ? item.cashValue : null,
+        cashChange: prevItem && chartFilters.cash ? calculateChange(item.cashValue, prevItem.cashValue) : null,
+        bonds: chartFilters.bonds ? item.bondsValue : null,
+        bondsChange: prevItem && chartFilters.bonds ? calculateChange(item.bondsValue, prevItem.bondsValue) : null,
+        equities: chartFilters.equities ? item.equitiesValue : null,
+        equitiesChange: prevItem && chartFilters.equities ? calculateChange(item.equitiesValue, prevItem.equitiesValue) : null,
+        alternatives: chartFilters.alternatives ? item.alternativesValue : null,
+        alternativesChange: prevItem && chartFilters.alternatives ? calculateChange(item.alternativesValue, prevItem.alternativesValue) : null
+      };
+    });
+  };
+
+  const toggleChartFilter = (assetClass) => {
+    setChartFilters(prev => ({
+      ...prev,
+      [assetClass]: !prev[assetClass]
     }));
   };
 
-  // Show loading screen
   if (loading) {
     return (
       <div style={{display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh'}}>
@@ -381,7 +476,6 @@ function App() {
     );
   }
 
-  // Show login screen if not authenticated
   if (!user) {
     return (
       <div className="login-container">
@@ -419,7 +513,6 @@ function App() {
     );
   }
 
-  // Main app (authenticated)
   return (
     <div className="app-container">
       <div className="header-info">
@@ -451,6 +544,12 @@ function App() {
           onClick={() => setActiveTab('positions')}
         >
           Positions
+        </button>
+        <button 
+          className={`tab ${activeTab === 'monthly-update' ? 'active' : ''}`}
+          onClick={() => setActiveTab('monthly-update')}
+        >
+          Monthly Update
         </button>
         <button 
           className={`tab ${activeTab === 'charts' ? 'active' : ''}`}
@@ -488,6 +587,29 @@ function App() {
               <div className="percentage">{getPercentage(assetSummary.alternatives)}%</div>
             </div>
           </div>
+
+          {portfolioHistory.length > 1 && (
+            <div className="performance-summary">
+              <h3>Performance Overview</h3>
+              {(() => {
+                const latest = portfolioHistory[portfolioHistory.length - 1];
+                const previous = portfolioHistory[portfolioHistory.length - 2];
+                const change = ((latest.totalValue - previous.totalValue) / previous.totalValue * 100).toFixed(2);
+                
+                return (
+                  <div className="performance-card">
+                    <div className={`performance-value ${change >= 0 ? 'positive' : 'negative'}`}>
+                      {change >= 0 ? '+' : ''}{change}%
+                    </div>
+                    <div className="performance-label">vs Previous Period</div>
+                    <div className="performance-detail">
+                      ${latest.totalValue.toLocaleString()} → ${previous.totalValue.toLocaleString()}
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+          )}
         </div>
       )}
 
@@ -553,19 +675,109 @@ function App() {
         </div>
       )}
 
+      {/* Monthly Update Tab */}
+      {activeTab === 'monthly-update' && (
+        <div className="tab-content">
+          <div className="monthly-update-header">
+            <h2>Monthly Portfolio Update</h2>
+            <div className="update-date-selector">
+              <label>Update Date:</label>
+              <input 
+                type="date" 
+                value={updateDate}
+                onChange={(e) => setUpdateDate(e.target.value)}
+              />
+            </div>
+          </div>
+
+          <table className="bulk-update-table">
+            <thead>
+              <tr>
+                <th>Position</th>
+                <th>Asset Class</th>
+                <th>Current Price</th>
+                <th>Current Value (USD)</th>
+                <th>Accrued Interest</th>
+              </tr>
+            </thead>
+            <tbody>
+              {positions.map(position => (
+                <tr key={position.id}>
+                  <td>{position.name}</td>
+                  <td>
+                    <span className={`asset-class-badge badge-${position.assetClass}`}>
+                      {position.assetClass}
+                    </span>
+                  </td>
+                  <td>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={bulkUpdates[position.id]?.currentPrice || ''}
+                      onChange={(e) => handleBulkUpdateChange(position.id, 'currentPrice', e.target.value)}
+                      className="bulk-input"
+                    />
+                  </td>
+                  <td>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={bulkUpdates[position.id]?.currentValue || ''}
+                      onChange={(e) => handleBulkUpdateChange(position.id, 'currentValue', e.target.value)}
+                      className="bulk-input"
+                    />
+                  </td>
+                  <td>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={bulkUpdates[position.id]?.accruedInterest || ''}
+                      onChange={(e) => handleBulkUpdateChange(position.id, 'accruedInterest', e.target.value)}
+                      className="bulk-input"
+                    />
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+
+          <div className="monthly-update-actions">
+            <button className="btn btn-success btn-large" onClick={saveMonthlyUpdate}>
+              Save Monthly Update & Create Snapshot
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Charts Tab */}
       {activeTab === 'charts' && (
         <div className="tab-content">
-          <div className="period-selector">
-            {['1m', '2m', '3m', '6m', '1y', '2y', 'all'].map(period => (
-              <button
-                key={period}
-                className={`period-btn ${selectedPeriod === period ? 'active' : ''}`}
-                onClick={() => setSelectedPeriod(period)}
-              >
-                {period.toUpperCase()}
-              </button>
-            ))}
+          <div className="chart-controls">
+            <div className="period-selector">
+              {['1m', '2m', '3m', '6m', '1y', '2y', 'all'].map(period => (
+                <button
+                  key={period}
+                  className={`period-btn ${selectedPeriod === period ? 'active' : ''}`}
+                  onClick={() => setSelectedPeriod(period)}
+                >
+                  {period.toUpperCase()}
+                </button>
+              ))}
+            </div>
+
+            <div className="asset-filters">
+              <label>Show Asset Classes:</label>
+              {Object.keys(chartFilters).map(assetClass => (
+                <label key={assetClass} className="filter-checkbox">
+                  <input
+                    type="checkbox"
+                    checked={chartFilters[assetClass]}
+                    onChange={() => toggleChartFilter(assetClass)}
+                  />
+                  <span className={`filter-label ${assetClass}`}>{assetClass.toUpperCase()}</span>
+                </label>
+              ))}
+            </div>
           </div>
 
           {getChartData().length > 0 ? (
@@ -593,17 +805,17 @@ function App() {
                     <YAxis />
                     <Tooltip />
                     <Legend />
-                    <Line type="monotone" dataKey="cash" stroke="#667eea" name="Cash" />
-                    <Line type="monotone" dataKey="bonds" stroke="#f5576c" name="Bonds" />
-                    <Line type="monotone" dataKey="equities" stroke="#4facfe" name="Equities" />
-                    <Line type="monotone" dataKey="alternatives" stroke="#43e97b" name="Alternatives" />
+                    {chartFilters.cash && <Line type="monotone" dataKey="cash" stroke="#667eea" name="Cash" />}
+                    {chartFilters.bonds && <Line type="monotone" dataKey="bonds" stroke="#f5576c" name="Bonds" />}
+                    {chartFilters.equities && <Line type="monotone" dataKey="equities" stroke="#4facfe" name="Equities" />}
+                    {chartFilters.alternatives && <Line type="monotone" dataKey="alternatives" stroke="#43e97b" name="Alternatives" />}
                   </LineChart>
                 </ResponsiveContainer>
               </div>
             </>
           ) : (
             <div style={{textAlign: 'center', padding: '60px', color: '#999'}}>
-              No historical data yet. Add monthly snapshots to see charts.
+              No historical data yet. Use the Monthly Update tab to save snapshots.
             </div>
           )}
         </div>
