@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { db } from './firebase';
+import { db, auth } from './firebase';
 import { 
   collection, 
   addDoc, 
@@ -12,10 +12,20 @@ import {
   getDoc,
   Timestamp
 } from 'firebase/firestore';
+import { signInWithEmailAndPassword, signOut, onAuthStateChanged } from 'firebase/auth';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import './App.css';
 
+// Session timeout in milliseconds (15 minutes)
+const SESSION_TIMEOUT = 15 * 60 * 1000;
+
 function App() {
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [loginError, setLoginError] = useState('');
+  
   const [activeTab, setActiveTab] = useState('dashboard');
   const [positions, setPositions] = useState([]);
   const [portfolioHistory, setPortfolioHistory] = useState([]);
@@ -29,6 +39,9 @@ function App() {
     equities: 0,
     alternatives: 0
   });
+
+  // Activity tracking
+  const [lastActivity, setLastActivity] = useState(Date.now());
 
   // Form state
   const [formData, setFormData] = useState({
@@ -48,17 +61,91 @@ function App() {
     ytm: ''
   });
 
-  // Load data on component mount
+  // Check authentication state
   useEffect(() => {
-    loadPositions();
-    loadLastUpdate();
-    loadPortfolioHistory();
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+      setLoading(false);
+      if (currentUser) {
+        setLastActivity(Date.now());
+      }
+    });
+    return () => unsubscribe();
   }, []);
+
+  // Track user activity
+  useEffect(() => {
+    if (!user) return;
+
+    const activityEvents = ['mousedown', 'keydown', 'scroll', 'touchstart'];
+    
+    const resetTimer = () => {
+      setLastActivity(Date.now());
+    };
+
+    activityEvents.forEach(event => {
+      window.addEventListener(event, resetTimer);
+    });
+
+    return () => {
+      activityEvents.forEach(event => {
+        window.removeEventListener(event, resetTimer);
+      });
+    };
+  }, [user]);
+
+  // Check for session timeout
+  useEffect(() => {
+    if (!user) return;
+
+    const interval = setInterval(() => {
+      const now = Date.now();
+      if (now - lastActivity > SESSION_TIMEOUT) {
+        handleLogout();
+        alert('Session expired due to inactivity. Please log in again.');
+      }
+    }, 60000); // Check every minute
+
+    return () => clearInterval(interval);
+  }, [user, lastActivity]);
+
+  // Load data when user is authenticated
+  useEffect(() => {
+    if (user) {
+      loadPositions();
+      loadLastUpdate();
+      loadPortfolioHistory();
+    }
+  }, [user]);
 
   // Calculate asset summary when positions change
   useEffect(() => {
     calculateAssetSummary();
   }, [positions]);
+
+  // Login handler
+  const handleLogin = async (e) => {
+    e.preventDefault();
+    setLoginError('');
+    
+    try {
+      await signInWithEmailAndPassword(auth, email, password);
+    } catch (error) {
+      setLoginError('Invalid email or password');
+      console.error('Login error:', error);
+    }
+  };
+
+  // Logout handler
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+      setPositions([]);
+      setPortfolioHistory([]);
+    } catch (error) {
+      console.error('Logout error:', error);
+    }
+  };
 
   // Load positions from Firestore
   const loadPositions = async () => {
@@ -145,20 +232,17 @@ function App() {
       };
 
       if (editingPosition) {
-        // Update existing position
         await setDoc(doc(db, 'positions', editingPosition.id), {
           ...positionData,
           updatedAt: Timestamp.now()
         }, { merge: true });
       } else {
-        // Add new position
         await addDoc(collection(db, 'positions'), {
           ...positionData,
           createdAt: Timestamp.now()
         });
       }
 
-      // Update last update timestamp
       await setDoc(doc(db, 'metadata', 'lastUpdate'), {
         timestamp: Timestamp.now()
       });
@@ -288,6 +372,54 @@ function App() {
     }));
   };
 
+  // Show loading screen
+  if (loading) {
+    return (
+      <div style={{display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh'}}>
+        <div>Loading...</div>
+      </div>
+    );
+  }
+
+  // Show login screen if not authenticated
+  if (!user) {
+    return (
+      <div className="login-container">
+        <div className="login-box">
+          <h1>Wealth Tracker</h1>
+          <p>Please log in to continue</p>
+          <form onSubmit={handleLogin}>
+            <div className="form-group">
+              <label>Email</label>
+              <input
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                required
+                autoComplete="email"
+              />
+            </div>
+            <div className="form-group">
+              <label>Password</label>
+              <input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                required
+                autoComplete="current-password"
+              />
+            </div>
+            {loginError && <div className="error-message">{loginError}</div>}
+            <button type="submit" className="btn btn-primary" style={{width: '100%', marginTop: '20px'}}>
+              Log In
+            </button>
+          </form>
+        </div>
+      </div>
+    );
+  }
+
+  // Main app (authenticated)
   return (
     <div className="app-container">
       <div className="header-info">
@@ -297,9 +429,14 @@ function App() {
             Last updated: {lastUpdate ? lastUpdate.toLocaleString() : 'Never'}
           </div>
         </div>
-        <button className="btn btn-primary" onClick={() => setShowModal(true)}>
-          Add Position
-        </button>
+        <div style={{display: 'flex', gap: '10px'}}>
+          <button className="btn btn-primary" onClick={() => setShowModal(true)}>
+            Add Position
+          </button>
+          <button className="btn btn-danger" onClick={handleLogout}>
+            Logout
+          </button>
+        </div>
       </div>
 
       <div className="tabs">
